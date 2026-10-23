@@ -17,7 +17,7 @@ node docs/velo-route/s0/s0-routage.mjs
 ```
 
 Durée : environ 2 min (une soixantaine de requêtes, espacées volontairement).
-Options : `--capabilities` (seulement les capacités), `--no-brouter`.
+Options : `--diagnostic` (capacités + diagnostic des requêtes, ~1 min), `--no-brouter`.
 
 Derrière un proxy d'entreprise (erreur `ENOTFOUND` ou `fetch failed`), avec Node ≥ 24 :
 `NODE_USE_ENV_PROXY=1 HTTPS_PROXY=http://proxy:port node docs/velo-route/s0/s0-routage.mjs`

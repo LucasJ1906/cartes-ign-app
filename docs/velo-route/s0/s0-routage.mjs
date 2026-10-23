@@ -9,7 +9,7 @@
  *
  * Usage (Node >= 18, aucune dépendance) :
  *   node docs/velo-route/s0/s0-routage.mjs                 # test complet
- *   node docs/velo-route/s0/s0-routage.mjs --capabilities  # uniquement les capacités du service
+ *   node docs/velo-route/s0/s0-routage.mjs --diagnostic    # capacités + diagnostic des requêtes
  *   node docs/velo-route/s0/s0-routage.mjs --no-brouter    # sans comparaison BRouter
  *
  * Sorties dans docs/velo-route/s0/out/ :
@@ -99,6 +99,9 @@ function extractCapabilities(caps) {
     }
     const constraintsParam = (route.availableParameters || []).find((p) => p.id === "constraints");
     extract[resource.id] = {
+      routeUrl: route.url || route.href || route.path || null,
+      operationKeys: Object.keys(route),
+      parameterIds: (route.availableParameters || []).map((p) => p.id),
       profiles: params.profile,
       optimizations: params.optimization,
       waysAttributes: params.waysAttributes,
@@ -158,12 +161,25 @@ function buildConstraints(resourceCaps, withCalm) {
   return out;
 }
 
-function geopfUrl(resource, profile, pts, constraints, attributes) {
-  const url = new URL(`${GEOPF}/itineraire`);
+let CAPS = {};
+
+// URL de l'opération route : celle annoncée par getcapabilities, sinon celle utilisée par l'app
+function routeBase(resource) {
+  const announced = CAPS[resource] && CAPS[resource].routeUrl;
+  return announced ? new URL(announced, "https://data.geopf.fr/") : new URL(`${GEOPF}/itineraire`);
+}
+
+function firstValue(values, fallback) {
+  const list = [].concat(values || []).map((v) => (v && typeof v === "object" ? (v.id ?? v.value ?? v.name) : v));
+  return list.includes(fallback) || list.length === 0 ? fallback : list[0];
+}
+
+function geopfUrl(resource, profile, pts, constraints, attributes, optimization = "shortest") {
+  const url = routeBase(resource);
   const fmt = (p) => `${p[0]},${p[1]}`;
   url.searchParams.set("resource", resource);
   url.searchParams.set("profile", profile);
-  url.searchParams.set("optimization", "shortest");
+  url.searchParams.set("optimization", optimization);
   url.searchParams.set("start", fmt(pts[0]));
   url.searchParams.set("end", fmt(pts[pts.length - 1]));
   if (pts.length > 2) {
@@ -282,6 +298,43 @@ async function testElevation(coords) {
   return results;
 }
 
+// Ajoute les paramètres un à un pour isoler celui qui fait échouer la requête
+async function runDiagnostic(caps) {
+  log("→ diagnostic (parcours 01, paramètres ajoutés un par un)");
+  const pts = ROUTES[0].pts;
+  const fmt = (p) => `${p[0]},${p[1]}`;
+  const out = [];
+  const resources = [...new Set(["bdtopo-osrm", ...Object.keys(caps)])];
+  for (const resource of resources) {
+    const c = caps[resource] || {};
+    const profile = firstValue(c.profiles, "car");
+    const optimization = firstValue(c.optimizations, "shortest");
+    const attributes = [].concat(c.waysAttributes || []).map((a) => (a && typeof a === "object" ? (a.id ?? a.name) : a)).filter(Boolean);
+    const firstConstraint = buildConstraints(c, false).slice(0, 1);
+    const steps = [
+      ["url-app-exacte", () => `${GEOPF}/itineraire?resource=${resource}&getSteps=false&timeUnit=second&optimization=${optimization}&start=${fmt(pts[0])}&end=${fmt(pts[1])}&profile=${profile}`],
+      ["url-capabilities", () => { const u = routeBase(resource); [["resource", resource], ["profile", profile], ["optimization", optimization], ["start", fmt(pts[0])], ["end", fmt(pts[1])]].forEach(([k, v]) => u.searchParams.set(k, v)); return u; }],
+      ["+geometryFormat", (u) => { u.searchParams.set("geometryFormat", "geojson"); return u; }],
+      ["+getSteps", (u) => { u.searchParams.set("getSteps", "true"); return u; }],
+      ["+unités", (u) => { u.searchParams.set("distanceUnit", "meter"); u.searchParams.set("timeUnit", "second"); return u; }],
+      ["+waysAttributes", (u) => { if (attributes.length) { u.searchParams.set("waysAttributes", attributes.join("|")); } return u; }],
+      ["+1 contrainte", (u) => { if (firstConstraint.length) { u.searchParams.set("constraints", firstConstraint[0]); } return u; }],
+    ];
+    let current = null;
+    for (const [step, build] of steps) {
+      current = step === "url-app-exacte" ? build() : step === "url-capabilities" ? build() : build(new URL(current));
+      const r = await getJson(current);
+      out.push({ resource, step, status: r.status, ms: r.ms, text: r.text.slice(0, 300), url: String(current) });
+      log(`   ${resource.padEnd(28)} ${step.padEnd(17)} HTTP ${r.status} ${r.status === 200 ? "" : r.text.slice(0, 100)}`);
+      if (step === "url-app-exacte") {
+        current = null;
+      }
+      await sleep(300);
+    }
+  }
+  return out;
+}
+
 async function main() {
   await mkdir(join(OUT, "geojson"), { recursive: true });
 
@@ -294,15 +347,28 @@ async function main() {
   await writeFile(join(OUT, "capabilities.json"), JSON.stringify(capsResp.body, null, 2));
   const caps = extractCapabilities(capsResp.body);
   await writeFile(join(OUT, "capabilities-extract.json"), JSON.stringify(caps, null, 2));
-  log(`  ressources : ${Object.keys(caps).join(", ")}`);
-  if (args.includes("--capabilities")) {
+  CAPS = caps;
+  Object.entries(caps).forEach(([id, c]) => {
+    log(`  ${id}`);
+    log(`     url=${c.routeUrl} profils=${JSON.stringify(c.profiles)} optim=${JSON.stringify(c.optimizations)}`);
+    log(`     contraintes=${c.constraintKeys.map((k) => k.key).join(",") || "aucune"} attributs=${JSON.stringify(c.waysAttributes)}`);
+  });
+  const diagnostic = await runDiagnostic(caps);
+  if (args.includes("--capabilities") || args.includes("--diagnostic")) {
+    await writeFile(join(OUT, "diagnostic.json"), JSON.stringify(diagnostic, null, 2));
     return;
   }
 
   const attrsOf = (res) => [].concat((caps[res] && caps[res].waysAttributes) || [])
     .map((a) => (a && typeof a === "object" ? (a.id ?? a.name) : a)).filter(Boolean);
 
+  const bikeVariants = Object.entries(caps).flatMap(([id, c]) => [].concat(c.profiles || [])
+    .map((p) => (p && typeof p === "object" ? (p.id ?? p.value ?? p.name) : p))
+    .filter((p) => /bike|velo|vélo|cycl/i.test(String(p)))
+    .map((p) => ({ id: `${id}-${p}`, label: `${id} profil ${p}`, resource: id, profile: p, constraints: () => buildConstraints(c, false) })));
+
   const variants = [
+    ...bikeVariants,
     { id: "osrm-car", label: "Actuel app (osrm car)", resource: "bdtopo-osrm", profile: "car", constraints: () => [] },
     { id: "pgr-car", label: "pgr car brut", resource: "bdtopo-pgr", profile: "car", constraints: () => [] },
     { id: "pgr-car-ban", label: "pgr car + bannis", resource: "bdtopo-pgr", profile: "car", constraints: () => buildConstraints(caps["bdtopo-pgr"], false) },
@@ -370,6 +436,9 @@ async function main() {
       if (feature) {
         const f = { type: "Feature", properties: { route: route.id, variant: "brouter-fastbike" }, geometry: feature.geometry };
         f.geometry.coordinates = f.geometry.coordinates.map((c) => c.slice(0, 2));
+        if (route.id === "08-ventoux" && !ventouxCoords) {
+          ventouxCoords = f.geometry.coordinates;
+        }
         collection.features.push(f);
         await writeFile(join(OUT, "geojson", `${route.id}__brouter-fastbike.geojson`), JSON.stringify({ type: "FeatureCollection", features: [f] }));
       }
@@ -381,12 +450,15 @@ async function main() {
   log("→ test altimétrie (Ventoux)");
   const elevation = ventouxCoords ? await testElevation(ventouxCoords) : [];
 
-  await writeFile(join(OUT, "results.json"), JSON.stringify({ date: new Date().toISOString(), caps, results, elevation }, null, 2));
+  await writeFile(join(OUT, "results.json"), JSON.stringify({ date: new Date().toISOString(), caps, diagnostic, results, elevation }, null, 2));
 
   // Rapport markdown
   const lines = [];
   lines.push("# S0 — Résultats du spike routage vélo", "", `Date : ${new Date().toISOString()}`, `Node : ${process.version}`, "");
   lines.push("## Capacités (extrait)", "", "```json", JSON.stringify(caps, null, 2).slice(0, 20000), "```", "");
+  lines.push("## Diagnostic des requêtes (parcours 01)", "", "| Ressource | Étape | HTTP | ms | Réponse | URL |", "|---|---|---|---|---|---|");
+  diagnostic.forEach((d) => lines.push(`| ${d.resource} | ${d.step} | ${d.status} | ${d.ms} | ${d.text.replace(/\|/g, "/").replace(/\n/g, " ").slice(0, 150)} | \`${d.url}\` |`));
+  lines.push("");
   lines.push("## Contraintes envoyées", "");
   variants.forEach((v) => lines.push(`- **${v.id}** : \`${v.constraints().join(" | ") || "aucune"}\``));
   lines.push("", "## Résultats par parcours", "");
