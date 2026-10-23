@@ -132,7 +132,7 @@ function constraint(type, key, operator, value) {
 // Construit les contraintes « vélo de route » à partir des capacités réelles
 function buildConstraints(resourceCaps, withCalm) {
   const out = [];
-  const keys = resourceCaps ? resourceCaps.constraintKeys : [];
+  const keys = (resourceCaps && resourceCaps.constraintKeys) || [];
   const wayType = keys.find((k) => /waytype/i.test(k.key));
   if (wayType && supports(wayType, "banned")) {
     const values = listValues(wayType);
@@ -157,15 +157,36 @@ function buildConstraints(resourceCaps, withCalm) {
         [4, 5].forEach((n) => out.push(constraint("prefer", importance.key, "=", pick(n))));
       }
     }
+    const classement = keys.find((k) => /classement_administratif/i.test(k.key));
+    if (classement && supports(classement, "avoid")) {
+      listValues(classement).filter((v) => /nationale/i.test(String(v))).forEach((v) => {
+        out.push(constraint("avoid", classement.key, "=", v));
+      });
+    }
   }
   return out;
 }
 
 let CAPS = {};
+let ROUTE_URL = null;
+
+// Attributs utiles au vélo (évite des URL trop longues)
+const USEFUL_ATTRS = ["nature", "importance", "itineraire_vert", "sens_de_circulation", "cpx_classement_administratif", "cpx_numero", "urbain"];
+
+// Cherche l'URL de l'opération « route » au niveau racine des capacités (format Road2)
+function findRouteUrl(body) {
+  const base = (body.info && body.info.url) || "https://data.geopf.fr/navigation/";
+  const ops = [].concat(body.operations || []);
+  const op = ops.find((o) => o && o.id === "route");
+  if (op && op.url) {
+    return String(new URL(op.url.replace(/^\//, ""), base.endsWith("/") ? base : `${base}/`));
+  }
+  return null;
+}
 
 // URL de l'opération route : celle annoncée par getcapabilities, sinon celle utilisée par l'app
 function routeBase(resource) {
-  const announced = CAPS[resource] && CAPS[resource].routeUrl;
+  const announced = (CAPS[resource] && CAPS[resource].routeUrl) || ROUTE_URL;
   return announced ? new URL(announced, "https://data.geopf.fr/") : new URL(`${GEOPF}/itineraire`);
 }
 
@@ -304,12 +325,13 @@ async function runDiagnostic(caps) {
   const pts = ROUTES[0].pts;
   const fmt = (p) => `${p[0]},${p[1]}`;
   const out = [];
-  const resources = [...new Set(["bdtopo-osrm", ...Object.keys(caps)])];
+  const resources = ["bdtopo-osrm", "bdtopo-pgr", "bdtopo-valhalla", "graphe_routier_r100_IGN", Object.keys(caps).filter((k) => /magellium/.test(k)).sort().pop()]
+    .filter(Boolean);
   for (const resource of resources) {
     const c = caps[resource] || {};
     const profile = firstValue(c.profiles, "car");
     const optimization = firstValue(c.optimizations, "shortest");
-    const attributes = [].concat(c.waysAttributes || []).map((a) => (a && typeof a === "object" ? (a.id ?? a.name) : a)).filter(Boolean);
+    const attributes = [].concat(c.waysAttributes || []).map((a) => (a && typeof a === "object" ? (a.id ?? a.name) : a)).filter((a) => USEFUL_ATTRS.includes(a));
     const firstConstraint = buildConstraints(c, false).slice(0, 1);
     const steps = [
       ["url-app-exacte", () => `${GEOPF}/itineraire?resource=${resource}&getSteps=false&timeUnit=second&optimization=${optimization}&start=${fmt(pts[0])}&end=${fmt(pts[1])}&profile=${profile}`],
@@ -325,7 +347,10 @@ async function runDiagnostic(caps) {
       current = step === "url-app-exacte" ? build() : step === "url-capabilities" ? build() : build(new URL(current));
       const r = await getJson(current);
       out.push({ resource, step, status: r.status, ms: r.ms, text: r.text.slice(0, 300), url: String(current) });
-      log(`   ${resource.padEnd(28)} ${step.padEnd(17)} HTTP ${r.status} ${r.status === 200 ? "" : r.text.slice(0, 100)}`);
+      log(`   ${resource.padEnd(40)} ${step.padEnd(17)} HTTP ${r.status} ${r.status === 200 ? "" : r.text.slice(0, 100)}`);
+      if (step === "url-app-exacte" || step === "url-capabilities") {
+        log(`      ${current}`);
+      }
       if (step === "url-app-exacte") {
         current = null;
       }
@@ -342,12 +367,18 @@ async function main() {
   const capsResp = await getJson(`${GEOPF}/getcapabilities`);
   if (capsResp.status !== 200 || !capsResp.body) {
     log(`Échec getcapabilities (HTTP ${capsResp.status}) : ${capsResp.text.slice(0, 300)}`);
-    process.exit(1);
+    process.exitCode = 1;
+    return;
   }
   await writeFile(join(OUT, "capabilities.json"), JSON.stringify(capsResp.body, null, 2));
   const caps = extractCapabilities(capsResp.body);
   await writeFile(join(OUT, "capabilities-extract.json"), JSON.stringify(caps, null, 2));
   CAPS = caps;
+  ROUTE_URL = findRouteUrl(capsResp.body);
+  log(`  clés racine des capacités : ${Object.keys(capsResp.body).join(", ")}`);
+  log(`  info : ${JSON.stringify(capsResp.body.info || null).slice(0, 300)}`);
+  log(`  opérations : ${JSON.stringify([].concat(capsResp.body.operations || []).map((o) => ({ id: o.id, url: o.url, methods: o.methods }))).slice(0, 600)}`);
+  log(`  URL route retenue : ${ROUTE_URL || `(défaut) ${GEOPF}/itineraire`}`);
   Object.entries(caps).forEach(([id, c]) => {
     log(`  ${id}`);
     log(`     url=${c.routeUrl} profils=${JSON.stringify(c.profiles)} optim=${JSON.stringify(c.optimizations)}`);
@@ -360,7 +391,7 @@ async function main() {
   }
 
   const attrsOf = (res) => [].concat((caps[res] && caps[res].waysAttributes) || [])
-    .map((a) => (a && typeof a === "object" ? (a.id ?? a.name) : a)).filter(Boolean);
+    .map((a) => (a && typeof a === "object" ? (a.id ?? a.name) : a)).filter((a) => USEFUL_ATTRS.includes(a));
 
   const bikeVariants = Object.entries(caps).flatMap(([id, c]) => [].concat(c.profiles || [])
     .map((p) => (p && typeof p === "object" ? (p.id ?? p.value ?? p.name) : p))
@@ -373,6 +404,7 @@ async function main() {
     { id: "pgr-car", label: "pgr car brut", resource: "bdtopo-pgr", profile: "car", constraints: () => [] },
     { id: "pgr-car-ban", label: "pgr car + bannis", resource: "bdtopo-pgr", profile: "car", constraints: () => buildConstraints(caps["bdtopo-pgr"], false) },
     { id: "pgr-car-calme", label: "pgr car + bannis + petites routes", resource: "bdtopo-pgr", profile: "car", constraints: () => buildConstraints(caps["bdtopo-pgr"], true) },
+    { id: "r100-car-calme", label: "graphe_routier_r100_IGN car + bannis + petites routes", resource: "graphe_routier_r100_IGN", profile: "car", constraints: () => buildConstraints(caps["graphe_routier_r100_IGN"], true) },
     { id: "valhalla-car-ban", label: "valhalla car + bannis", resource: "bdtopo-valhalla", profile: "car", constraints: () => buildConstraints(caps["bdtopo-valhalla"], false) },
   ].filter((v) => caps[v.resource]);
 
@@ -486,5 +518,5 @@ async function main() {
 
 main().catch((err) => {
   console.error(err);
-  process.exit(1);
+  process.exitCode = 1;
 });
