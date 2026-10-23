@@ -10,6 +10,7 @@
  * Usage (Node >= 18, aucune dépendance) :
  *   node docs/velo-route/s0/s0-routage.mjs                 # test complet
  *   node docs/velo-route/s0/s0-routage.mjs --diagnostic    # capacités + diagnostic des requêtes
+ *   node docs/velo-route/s0/s0-routage.mjs --probe         # quelles adresses du service répondent
  *   node docs/velo-route/s0/s0-routage.mjs --no-brouter    # sans comparaison BRouter
  *
  * Sorties dans docs/velo-route/s0/out/ :
@@ -360,8 +361,44 @@ async function runDiagnostic(caps) {
   return out;
 }
 
+// Sonde : quelles adresses du service de navigation répondent encore ?
+async function runProbe() {
+  log("→ sonde des adresses du service de navigation");
+  const q = "resource=bdtopo-pgr&profile=car&optimization=shortest&start=1.8346,48.6436&end=2.0423,48.7065";
+  const qv = "resource=bdtopo-valhalla&profile=car&optimization=fastest&start=1.8346,48.6436&end=2.0423,48.7065";
+  const qr = "resource=graphe_routier_r100_IGN&profile=car&optimization=shortest&start=1.8346,48.6436&end=2.0423,48.7065";
+  const urls = [
+    `${GEOPF}/getcapabilities`,
+    `${GEOPF}/itineraire?${q}`,
+    `${GEOPF}/itineraire?${qv}`,
+    `${GEOPF}/itineraire?${qr}`,
+    `${GEOPF}/itineraire?resource=bdtopo-osrm&profile=car&optimization=fastest&start=1.8346,48.6436&end=2.0423,48.7065`,
+    `${GEOPF}/route?${q}`,
+    `${GEOPF}/simple/1.0.0/route?${q}`,
+    `${GEOPF}/simple/1.0.0/getcapabilities`,
+    `https://data.geopf.fr/simple/1.0.0/route?${q}`,
+    `${GEOPF}/isochrone?resource=bdtopo-valhalla&profile=car&costType=time&costValue=600&timeUnit=second&point=1.8346,48.6436`,
+    `${GEOPF}/isochrone?resource=bdtopo-pgr&profile=car&costType=time&costValue=600&timeUnit=second&point=1.8346,48.6436`,
+    `${GEOPF}/openapi/swagger.json`,
+    `${GEOPF}/openapi/openapi.json`,
+  ];
+  const out = [];
+  for (const url of urls) {
+    const r = await getJson(url);
+    out.push({ url, status: r.status, ms: r.ms, text: r.text.slice(0, 200) });
+    log(`   HTTP ${r.status} ${String(r.ms).padStart(5)} ms  ${url.replace("https://data.geopf.fr", "")}`);
+    log(`        ${r.text.replace(/\s+/g, " ").slice(0, 140)}`);
+    await sleep(300);
+  }
+  await writeFile(join(OUT, "probe.json"), JSON.stringify(out, null, 2));
+}
+
 async function main() {
   await mkdir(join(OUT, "geojson"), { recursive: true });
+  if (args.includes("--probe")) {
+    await runProbe();
+    return;
+  }
 
   log("→ getcapabilities");
   const capsResp = await getJson(`${GEOPF}/getcapabilities`);
